@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      composer_version:
+        description: 'Composer version'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Get Composer version
+      id: version
+      run: |
+        if [ -n "${{ github.event.inputs.composer_version }}" ]; then
+          echo "COMPOSER_VERSION=${{ github.event.inputs.composer_version }}" >> $GITHUB_ENV
+        else
+          source .env
+          echo "COMPOSER_VERSION=${COMPOSER_VERSION}" >> $GITHUB_ENV
+        fi
+        
+    - uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+        
+    - uses: docker/build-push-action@v5
+      with:
+        push: true
+        build-args: |
+          COMPOSER_VERSION=${{ env.COMPOSER_VERSION }}
+        tags: |
+          ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ env.COMPOSER_VERSION }}
+          ${{ secrets.DOCKER_USERNAME }}/laravel-installer:latest
