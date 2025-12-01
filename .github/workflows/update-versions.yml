@@ -1,0 +1,69 @@
+name: Update Laravel Installer Versions
+
+on:
+  schedule:
+    # Run every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+jobs:
+  update-versions:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Fetch latest Laravel installer versions
+        id: fetch-versions
+        run: |
+          echo "Fetching Laravel installer versions from Packagist..."
+          
+          # Fetch package data from Packagist API
+          RESPONSE=$(curl -s "https://repo.packagist.org/p2/laravel/installer.json")
+          
+          # Extract stable versions (exclude dev-*, sort by version, take last 5)
+          VERSIONS=$(echo "$RESPONSE" | jq -r '
+            .packages."laravel/installer" 
+            | to_entries 
+            | map(select(.key | startswith("dev-") | not))
+            | map(select(.key | startswith("v")))
+            | map(.key | ltrimstr("v"))
+            | sort_by(split(".") | map(tonumber))
+            | reverse
+            | .[0:5]
+          ')
+          
+          # Write to versions.json
+          echo "$VERSIONS" > versions.json
+          
+          echo "Latest 5 versions:"
+          cat versions.json
+      
+      - name: Check for changes
+        id: git-check
+        run: |
+          git diff --exit-code versions.json || echo "changed=true" >> $GITHUB_OUTPUT
+      
+      - name: Commit and push if changed
+        if: steps.git-check.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "chore: update Laravel installer versions"
+          git push
+      
+      - name: Trigger Docker build workflow
+        if: steps.git-check.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'docker.yml',
+              ref: 'main'
+            })

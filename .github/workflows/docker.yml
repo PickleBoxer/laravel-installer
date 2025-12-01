@@ -1,40 +1,114 @@
-name: Build
+name: Build and Push Docker Images
 
 on:
   push:
     branches: [main]
+    paths:
+      - 'versions.json'
+      - 'Dockerfile'
+      - '.github/workflows/docker.yml'
   workflow_dispatch:
-    inputs:
-      composer_version:
-        description: 'Composer version'
-        required: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v4
+    permissions:
+      contents: read
+      packages: write
     
-    - name: Get Composer version
-      id: version
-      run: |
-        if [ -n "${{ github.event.inputs.composer_version }}" ]; then
-          echo "COMPOSER_VERSION=${{ github.event.inputs.composer_version }}" >> $GITHUB_ENV
-        else
-          source .env
-          echo "COMPOSER_VERSION=${COMPOSER_VERSION}" >> $GITHUB_ENV
-        fi
-        
-    - uses: docker/login-action@v3
-      with:
-        username: ${{ secrets.DOCKER_USERNAME }}
-        password: ${{ secrets.DOCKER_PASSWORD }}
-        
-    - uses: docker/build-push-action@v5
-      with:
-        push: true
-        build-args: |
-          COMPOSER_VERSION=${{ env.COMPOSER_VERSION }}
-        tags: |
-          ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ env.COMPOSER_VERSION }}
-          ${{ secrets.DOCKER_USERNAME }}/laravel-installer:latest
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.prepare.outputs.versions) }}
+      fail-fast: false
+    
+    needs: prepare
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKER_USERNAME }}/laravel-installer
+          tags: |
+            type=raw,value=${{ matrix.version }}
+            type=raw,value=latest,enable=${{ matrix.version == needs.prepare.outputs.latest_version }}
+          labels: |
+            org.opencontainers.image.title=Laravel Installer
+            org.opencontainers.image.description=Docker image for Laravel Installer v${{ matrix.version }}
+            org.opencontainers.image.vendor=PickleBoxer
+            org.opencontainers.image.version=${{ matrix.version }}
+      
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          build-args: |
+            INSTALLER_VERSION=${{ matrix.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Test image (smoke test)
+        run: |
+          echo "Testing Laravel Installer v${{ matrix.version }}..."
+          
+          # Test that the image runs and shows version
+          docker run --rm ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version
+          
+          # Verify the version output contains expected information
+          VERSION_OUTPUT=$(docker run --rm ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version)
+          
+          if echo "$VERSION_OUTPUT" | grep -q "Laravel Installer"; then
+            echo "✅ Smoke test passed: Laravel Installer is working"
+          else
+            echo "❌ Smoke test failed: Unexpected version output"
+            exit 1
+          fi
+      
+      - name: Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            INSTALLER_VERSION=${{ matrix.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.set-versions.outputs.versions }}
+      latest_version: ${{ steps.set-versions.outputs.latest_version }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Read versions from file
+        id: set-versions
+        run: |
+          VERSIONS=$(cat versions.json | jq -c .)
+          LATEST=$(cat versions.json | jq -r '.[0]')
+          
+          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
+          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+          
+          echo "Building versions: $VERSIONS"
+          echo "Latest version: $LATEST"
