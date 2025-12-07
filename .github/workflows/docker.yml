@@ -1,5 +1,4 @@
 name: Build and Push Docker Images
-
 on:
   push:
     branches: [main]
@@ -10,8 +9,51 @@ on:
   workflow_dispatch:
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.filter-versions.outputs.versions }}
+      latest_version: ${{ steps.filter-versions.outputs.latest_version }}
+      has_versions: ${{ steps.filter-versions.outputs.has_versions }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Filter versions to build
+        id: filter-versions
+        run: |
+          echo "Checking which versions need to be built..."
+          
+          ALL_VERSIONS=$(cat versions.json | jq -r '.[]')
+          VERSIONS_TO_BUILD=[]
+          
+          for VERSION in $ALL_VERSIONS; do
+            echo "Checking if ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${VERSION} exists..."
+            
+            # Try to pull the manifest - if it fails, the image doesn't exist
+            if docker manifest inspect ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${VERSION} > /dev/null 2>&1; then
+              echo "✓ Version ${VERSION} already exists, skipping"
+            else
+              echo "✗ Version ${VERSION} does not exist, will build"
+              VERSIONS_TO_BUILD=$(echo "$VERSIONS_TO_BUILD" | jq --arg v "$VERSION" '. + [$v]')
+            fi
+          done
+          
+          LATEST=$(cat versions.json | jq -r '.[0]')
+          HAS_VERSIONS=$(echo "$VERSIONS_TO_BUILD" | jq 'length > 0')
+          
+          echo "versions=$VERSIONS_TO_BUILD" >> $GITHUB_OUTPUT
+          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
+          echo "has_versions=$HAS_VERSIONS" >> $GITHUB_OUTPUT
+          
+          echo "Versions to build: $VERSIONS_TO_BUILD"
+          echo "Latest version: $LATEST"
+
   build:
     runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.has_versions == 'true'
     permissions:
       contents: read
       packages: write
@@ -21,11 +63,12 @@ jobs:
         version: ${{ fromJson(needs.prepare.outputs.versions) }}
       fail-fast: false
     
-    needs: prepare
-    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
       
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -50,12 +93,12 @@ jobs:
             org.opencontainers.image.vendor=PickleBoxer
             org.opencontainers.image.version=${{ matrix.version }}
       
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          load: true
+          platforms: linux/amd64,linux/arm64
+          push: true
           build-args: |
             INSTALLER_VERSION=${{ matrix.version }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -68,10 +111,10 @@ jobs:
           echo "Testing Laravel Installer v${{ matrix.version }}..."
           
           # Test that the image runs and shows version
-          docker run --rm ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version
+          docker run --rm --platform linux/amd64 ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version
           
           # Verify the version output contains expected information
-          VERSION_OUTPUT=$(docker run --rm ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version)
+          VERSION_OUTPUT=$(docker run --rm --platform linux/amd64 ${{ secrets.DOCKER_USERNAME }}/laravel-installer:${{ matrix.version }} --version)
           
           if echo "$VERSION_OUTPUT" | grep -q "Laravel Installer"; then
             echo "✅ Smoke test passed: Laravel Installer is working"
@@ -79,36 +122,20 @@ jobs:
             echo "❌ Smoke test failed: Unexpected version output"
             exit 1
           fi
-      
-      - name: Push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          build-args: |
-            INSTALLER_VERSION=${{ matrix.version }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
 
-  prepare:
+  summary:
     runs-on: ubuntu-latest
-    outputs:
-      versions: ${{ steps.set-versions.outputs.versions }}
-      latest_version: ${{ steps.set-versions.outputs.latest_version }}
-    
+    needs: [prepare, build]
+    if: always()
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Read versions from file
-        id: set-versions
+      - name: Build Summary
         run: |
-          VERSIONS=$(cat versions.json | jq -c .)
-          LATEST=$(cat versions.json | jq -r '.[0]')
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "versions=$VERSIONS" >> $GITHUB_OUTPUT
-          echo "latest_version=$LATEST" >> $GITHUB_OUTPUT
-          
-          echo "Building versions: $VERSIONS"
-          echo "Latest version: $LATEST"
+          if [ "${{ needs.prepare.outputs.has_versions }}" == "true" ]; then
+            echo "✅ Built versions: ${{ needs.prepare.outputs.versions }}" >> $GITHUB_STEP_SUMMARY
+            echo "📦 Latest version: ${{ needs.prepare.outputs.latest_version }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "ℹ️ No new versions to build - all images already exist" >> $GITHUB_STEP_SUMMARY
+          fi
